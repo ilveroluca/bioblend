@@ -6,6 +6,7 @@ A basic object-oriented interface for Galaxy entities.
 
 import abc, collections, json
 
+from client import ObjHistoryClient
 
 __all__ = [
     'Wrapper',
@@ -60,13 +61,16 @@ class Wrapper(object):
     __metaclass__ = abc.ABCMeta
 
     @abc.abstractmethod
-    def __init__(self, wrapped, parent=None):
+    def __init__(self, wrapped, parent=None, gi=None):
         """
         :type wrapped: dict
         :param wrapped: JSON-serializable dictionary
 
         :type parent: :class:`Wrapper`
         :param parent: the parent of this wrapper
+
+        :type gi: :class:`GalaxyInstance`
+        :param gi: the GalaxyInstance through which we can access this wrapper
         """
         if not isinstance(wrapped, collections.Mapping):
             raise TypeError('wrapped object must be a mapping type')
@@ -80,6 +84,7 @@ class Wrapper(object):
             object.__setattr__(self, k, self.wrapped.get(k))
         object.__setattr__(self, 'parent', parent)
         object.__setattr__(self, 'is_modified', False)
+        object.__setattr__(self, 'gi', gi)
 
     @property
     def is_mapped(self):
@@ -150,7 +155,7 @@ class Step(Wrapper):
 
     @abc.abstractmethod
     def __init__(self, step_dict, parent):
-        super(Step, self).__init__(step_dict, parent=parent)
+        super(Step, self).__init__(step_dict, parent=parent, gi=parent.gi)
 
 
 class DataInput(Step):
@@ -179,20 +184,6 @@ class Tool(Step):
                 self, 'tool_state', _recursive_loads(self.tool_state)
                 )
 
-
-def _build_step(step_dict, parent):
-    try:
-        stype = step_dict['type']
-    except KeyError:
-        raise ValueError('not a step dict')
-    if stype == 'data_input':
-        return DataInput(step_dict, parent)
-    elif stype == 'tool':
-        return Tool(step_dict, parent)
-    else:
-        raise ValueError('unknown step type: %r' % (stype,))
-
-
 class Workflow(Wrapper):
     """
     Workflows represent ordered sequences of computations on Galaxy.
@@ -202,7 +193,7 @@ class Workflow(Wrapper):
     """
     BASE_ATTRS = Wrapper.BASE_ATTRS + ('annotation',)
 
-    def __init__(self, wf_dict, id=None, inputs=None):
+    def __init__(self, wf_dict, id=None, inputs=None, gi=None):
         """
         :type wf_dict: dict
         :param wf_dict: a JSON-deserialized dictionary such as the one
@@ -220,9 +211,9 @@ class Workflow(Wrapper):
           {'label': LABEL, 'value': VALUE}, ...}``.  Currently, only
           the IDs are used.
         """
-        super(Workflow, self).__init__(wf_dict)
+        super(Workflow, self).__init__(wf_dict, gi=gi)
         # outer keys = unencoded ids, e.g., '99', '100'
-        steps = [_build_step(v, self) for _, v in sorted(
+        steps = [self._build_step(v, self) for _, v in sorted(
             wf_dict['steps'].items(), key=lambda t: int(t[0])
             )]
         if inputs is not None:
@@ -230,6 +221,19 @@ class Workflow(Wrapper):
         object.__setattr__(self, 'steps', steps)
         object.__setattr__(self, 'id', id)
         object.__setattr__(self, 'inputs', inputs)
+
+    @staticmethod
+    def _build_step(step_dict, parent):
+        try:
+            stype = step_dict['type']
+        except KeyError:
+            raise ValueError('not a step dict')
+        if stype == 'data_input':
+            return DataInput(step_dict, parent)
+        elif stype == 'tool':
+            return Tool(step_dict, parent)
+        else:
+            raise ValueError('unknown step type: %r' % (stype,))
 
     @property
     def is_mapped(self):
@@ -267,6 +271,23 @@ class Workflow(Wrapper):
             m[i] = {'id': ds.id, 'src': ds.SRC}
         return m
 
+    def import_me(self):
+        return self.gi.workflows.import_one(self)
+
+    def preview(self):
+        ws = [ _ for _ in self.gi.workflows.get_previews(name=self.name) if _.id == self.id ]
+        if len(ws) > 1:
+            raise NotImplementedError("Didn't think there could be more than one preview. File a bug report")
+        return ws[0] if len(ws) > 0 else None
+
+    def run(self, inputs, history, params=None, import_inputs=False, wait=True):
+        outputs, history = self.gi.workflows.run(self, inputs, history, params, import_inputs)
+        if wait:
+            self.gi.workflows.wait(outputs, history)
+        return outputs, history
+
+    def delete(self):
+        self.gi.workflows.delete(self)
 
 class Dataset(Wrapper):
     """
@@ -276,10 +297,41 @@ class Dataset(Wrapper):
     __metaclass__ = abc.ABCMeta
 
     @abc.abstractmethod
-    def __init__(self, ds_dict, container_id):
-        super(Dataset, self).__init__(ds_dict)
+    def __init__(self, ds_dict, container_id, gi=None):
+        super(Dataset, self).__init__(ds_dict, gi=gi)
         object.__setattr__(self, 'container_id', container_id)
 
+    def get_stream(self, chunk_size=None):
+        """
+        Open ``dataset`` for reading and return an iterator over its contents.
+
+        :type chunk_size: int
+        :param chunk_size: read this amount of bytes at a time
+        """
+        raise NotImplementedError()
+
+    def peek(self, chunk_size=None):
+       return self.get_stream(chunk_size).next()
+
+    def download(self, file_object, chunk_size=None):
+        for chunk in self.get_stream(chunk_size=chunk_size):
+            file_object.write(chunk)
+
+    def get_contents(self, chunk_size=None):
+        return ''.join(self.get_stream(chunk_size=chunk_size))
+
+    def refresh(self):
+        """
+        Re-fetch the attributes pertaining to this object.
+
+        Returns: self
+        """
+        raise NotImplementedError()
+
+    def _refresh_imp(self, gi_module):
+        fresh = gi_module.get_dataset(self.container_id, self.id)
+        self.__init__(fresh.wrapped, self.container_id, self.gi)
+        return self
 
 class HistoryDatasetAssociation(Dataset):
     """
@@ -288,30 +340,41 @@ class HistoryDatasetAssociation(Dataset):
     BASE_ATTRS = Dataset.BASE_ATTRS + ('state',)
     SRC = 'hda'
 
-    def __init__(self, ds_dict, container_id):
-        super(HistoryDatasetAssociation, self).__init__(ds_dict, container_id)
+    def __init__(self, ds_dict, container_id, gi=None):
+        super(HistoryDatasetAssociation, self).__init__(ds_dict, container_id, gi=gi)
+
+    def get_stream(self, chunk_size=None):
+        return self.gi.histories.get_stream(self, chunk_size)
+
+    def refresh(self):
+        return self._refresh_imp(self.gi.histories)
+
+    def wait(self, polling_interval=None):
+        ObjHistoryClient.wait(self, polling_interval)
 
 
-class LibraryDatasetDatasetAssociation(Dataset):
+class LibRelatedDataset(Dataset):
+    def __init__(self, ds_dict, container_id, gi=None):
+        super(LibRelatedDataset, self).__init__(ds_dict, container_id, gi=gi)
+
+    def get_stream(self, chunk_size=None):
+        return self.gi.libraries.get_stream(self, chunk_size)
+
+    def refresh(self):
+        return self._refresh_imp(self.gi.libraries)
+
+
+class LibraryDatasetDatasetAssociation(LibRelatedDataset):
     """
     Maps to a Galaxy ``LibraryDatasetDatasetAssociation``.
     """
     SRC = 'ldda'
 
-    def __init__(self, ds_dict, container_id):
-        super(LibraryDatasetDatasetAssociation, self).__init__(
-            ds_dict, container_id
-            )
-
-
-class LibraryDataset(Dataset):
+class LibraryDataset(LibRelatedDataset):
     """
     Maps to a Galaxy ``LibraryDataset``.
     """
     SRC = 'ld'
-
-    def __init__(self, ds_dict, container_id):
-        super(LibraryDataset, self).__init__(ds_dict, container_id)
 
 
 class DatasetContainer(Wrapper):
@@ -321,16 +384,25 @@ class DatasetContainer(Wrapper):
     __metaclass__ = abc.ABCMeta
 
     @abc.abstractmethod
-    def __init__(self, c_dict, dataset_ids=None):
+    def __init__(self, c_dict, dataset_ids=None, gi=None):
         """
         :type dataset_ids: list of str
         :param dataset_ids: ids of datasets associated with this container
         """
-        super(DatasetContainer, self).__init__(c_dict)
+        super(DatasetContainer, self).__init__(c_dict, gi=gi)
         if dataset_ids is None:
             dataset_ids = []
         object.__setattr__(self, 'dataset_ids', dataset_ids)
 
+    @staticmethod
+    def _preview(obj, gi_module):
+        raise NotImplementedError()
+        # TODO: how do I know whether this history has been deleted? Figure it out
+        # and fix the deleted= argument below
+        hs = [ _ for _ in gi_module.get_previews(name=obj.name, deleted=obj.state) if _.id == obj.id ]
+        if len(hs) > 1:
+            raise NotImplementedError("Didn't think there could be more than one preview. File a bug report")
+        return hs[0] if len(hs) > 0 else None
 
 class History(DatasetContainer):
     """
@@ -340,9 +412,30 @@ class History(DatasetContainer):
     DS_TYPE = HistoryDatasetAssociation
     API_MODULE = 'histories'
 
-    def __init__(self, hist_dict, dataset_ids=None):
-        super(History, self).__init__(hist_dict, dataset_ids=dataset_ids)
+    def __init__(self, hist_dict, dataset_ids=None, gi=None):
+        # XXX: how do we keep this local dataset id list synchronized with the remote contents?
+        super(History, self).__init__(hist_dict, dataset_ids=dataset_ids, gi=gi)
 
+    def preview(self):
+        return self._preview(self, self.gi.histories)
+
+    def update(self, name=None, annotation=None):
+        # TODO: wouldn't it be better if name and annotation were attributes?
+        # TODO: do we need to ensure the attributes of `self` are the same as
+        # the ones returned by the call to `update` below?
+        return self.gi.histories.update(self, name, annotation)
+
+    def delete(self, purge=False):
+        self.gi.histories.delete(self, purge)
+
+    def import_dataset(self, lds):
+        return self.gi.histories.import_dataset(self, lds)
+
+    def get_dataset(self, ds_id):
+        return self.gi.histories.get_dataset(self, ds_id)
+
+    def get_datasets(self):
+        return self.gi.histories.get_datasets(self)
 
 class Library(DatasetContainer):
     """
@@ -352,12 +445,41 @@ class Library(DatasetContainer):
     DS_TYPE = LibraryDataset
     API_MODULE = 'libraries'
 
-    def __init__(self, lib_dict, dataset_ids=None, folder_ids=None):
-        super(Library, self).__init__(lib_dict, dataset_ids=dataset_ids)
+    def __init__(self, lib_dict, dataset_ids=None, folder_ids=None, gi=None):
+        super(Library, self).__init__(lib_dict, dataset_ids=dataset_ids, gi=gi)
         if folder_ids is None:
             folder_ids = []
         object.__setattr__(self, 'folder_ids', folder_ids)
 
+    def preview(self):
+        return self._preview(self, self.gi.libraries)
+
+    def delete(self):
+        self.gi.libraries.delete(self)
+
+    def upload_data(self, data, folder=None, **kwargs):
+        return self.gi.libraries.upload_data(self, data, folder, **kwargs)
+
+    def upload_from_url(self, url, folder=None, **kwargs):
+        return self.gi.libraries.upload_from_url(self, url, folder, **kwargs)
+
+    def upload_from_local(self, path, folder=None, **kwargs):
+        return self.gi.libraries.upload_from_local(self, path, folder, **kwargs)
+
+    def upload_from_galaxy_fs(self, paths, folder=None, **kwargs):
+        return self.gi.libraries.upload_from_galaxy_fs(self, paths, folder, **kwargs)
+
+    def get_dataset(self, ds_id):
+        return self.gi.libraries.get_dataset(self, ds_id)
+
+    def get_datasets(self):
+        return self.gi.libraries.get_datasets(self)
+
+    def create_folder(self, name, description=None, base_folder=None):
+        return self.gi.libraries.create_folder(self, name, description, base_folder)
+
+    def get_folder(self, f_id):
+        return self.gi.libraries.get_folder(self, f_id)
 
 class Folder(Wrapper):
     """
@@ -365,8 +487,8 @@ class Folder(Wrapper):
     """
     BASE_ATTRS = Wrapper.BASE_ATTRS + ('description', 'item_count')
 
-    def __init__(self, f_dict, container_id):
-        super(Folder, self).__init__(f_dict)
+    def __init__(self, f_dict, container_id, gi=None):
+        super(Folder, self).__init__(f_dict, gi=gi)
         if self.id.startswith('F'):  # folder id from library contents
             object.__setattr__(self, 'id', self.id[1:])
         object.__setattr__(self, 'container_id', container_id)
@@ -382,8 +504,8 @@ class Preview(Wrapper):
     __metaclass__ = abc.ABCMeta
 
     @abc.abstractmethod
-    def __init__(self, pw_dict):
-        super(Preview, self).__init__(pw_dict)
+    def __init__(self, pw_dict, gi=None):
+        super(Preview, self).__init__(pw_dict, gi=gi)
 
 
 class LibraryPreview(Preview):
@@ -393,8 +515,8 @@ class LibraryPreview(Preview):
     Instances of this class wrap dictionaries obtained by getting
     ``/api/libraries`` from Galaxy.
     """
-    def __init__(self, pw_dict):
-        super(LibraryPreview, self).__init__(pw_dict)
+    def __init__(self, pw_dict, gi=None):
+        super(LibraryPreview, self).__init__(pw_dict, gi=gi)
 
 
 class HistoryPreview(Preview):
@@ -404,8 +526,8 @@ class HistoryPreview(Preview):
     Instances of this class wrap dictionaries obtained by getting
     ``/api/histories`` from Galaxy.
     """
-    def __init__(self, pw_dict):
-        super(HistoryPreview, self).__init__(pw_dict)
+    def __init__(self, pw_dict, gi=None):
+        super(HistoryPreview, self).__init__(pw_dict, gi=gi)
 
 
 class WorkflowPreview(Preview):
@@ -415,5 +537,5 @@ class WorkflowPreview(Preview):
     Instances of this class wrap dictionaries obtained by getting
     ``/api/workflows`` from Galaxy.
     """
-    def __init__(self, pw_dict):
-        super(WorkflowPreview, self).__init__(pw_dict)
+    def __init__(self, pw_dict, gi=None):
+        super(WorkflowPreview, self).__init__(pw_dict, gi=gi)
